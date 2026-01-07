@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        fieldset {
+            margin-bottom: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        
+        legend {
+            font-weight: bold;
+        }
+
+        label {
+            margin-right: 10px;
+        }
+
+        select {
+            margin-right: 20px;
+        }
+
+        button {
+            margin-top: 20px;
+        }
+
+        p {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <fieldset>
+        <legend></legend>
+        <label for="dataType">Data Type:</label>
+        <select id="dataType">
+            <!-- <option value="float32">float32</option> -->
+            <option value="float16">float16</option>
+        </select>
+    </fieldset>
+
+    <fieldset>
+        <legend></legend>
+        <label for="queryType">Query Type:</label>
+        <select id="queryType">
+            <option value="group query">Group query (group size=8)</option>
+            <!-- <option value="single query">Single query (group size=1)</option> -->
+        </select>
+    </fieldset>
+
+    <fieldset>
+        <legend></legend>
+        <label for="stage">Stage:</label>
+        <select id="stage">
+            <!-- <option value="Prefilling">Prefilling</option> -->
+            <option value="Decoding">Decoding</option>
+        </select>
+    </fieldset>
+
+    <button id="start">Start</button>
+    <p id="log"></p>
+    <script src="./dist-gqa-no-cast/ort.webgpu.js"></script>
+    <!-- <script src="./onnxruntime-web/dist/ort.jspi.js"></script> -->
+    <script>
+
+        ort.env.wasm.simd = true;
+        ort.env.wasm.proxy = false;
+        ort.env.wasm.numThreads = 0;
+
+        const log = document.getElementById('log');
+
+        async function run(model_path, inputs, outputs) {
+            log.innerHTML = 'start running model ' + model_path + "<br>";
+            var feeds = {};
+            let inputTensor;
+
+            /*
+              emulate one decode step.
+            */
+            const batch_size = 1;
+            const past_seq_len = 25;
+            const seq_len = 1;
+            // const total_seq_len = past_seq_len + seq_len;
+            const total_seq_len  = past_seq_len;
+
+            for (let index = 0; index < inputs.length; index++) {
+                const input_name = inputs[index];
+                console.log(index, input_name);
+                if (input_name === 'input_ids') {
+                    inputTensor = new ort.Tensor(
+                        "int64",
+                        new BigInt64Array([[BigInt(25362)]]),
+                        [batch_size, seq_len]
+                    );
+                }
+                if (input_name === 'attention_mask') {
+                    inputTensor = new ort.Tensor(
+                        "int64",
+                        generateBuffer(
+                            "int64",
+                            [batch_size, total_seq_len],
+                            1
+                        ),
+                        [batch_size, total_seq_len]
+                    );
+                }
+                if (input_name === 'position_ids') {
+                    inputTensor = new ort.Tensor(
+                        "int64",
+                        new BigInt64Array([BigInt(total_seq_len-1)]),
+                        [batch_size, seq_len]
+                    );
+                }
+                if (input_name.startsWith('past_key_values')) {
+                    let past_kv_shape = [batch_size, 2, past_seq_len, 64];
+                    inputTensor = new ort.Tensor(
+                        'float16',
+                        // new Float32Array(genPastArr(dim_, past_seq_len)),
+                        randomBuffer(
+                            'float16',
+                            past_kv_shape
+                        ),
+                        past_kv_shape
+                    );
+                }
+                feeds[input_name] = inputTensor;
+                console.log("input tensor", inputTensor);
+            }
+
+            console.log('Creating session for webnn ep....');
+            const session_webnn = await ort.InferenceSession.create(model_path, {
+                executionProviders: [{ name: "webnn", deviceType: "gpu", powerPreference: "default" }],
+                // logSeverityLevel: 0,
+                freeDimensionOverrides: { "batch_size": batch_size, "sequence_length": seq_len, "past_sequence_length": past_seq_len, "total_sequence_length": total_seq_len},
+            });
+            console.log('...done.');
+            console.log('Creating session for cpu ep....');
+            const session = await ort.InferenceSession.create(model_path, {
+                executionProviders: [{ name: "wasm", deviceType: 0, powerPreference: 1 }],
+                freeDimensionOverrides: { "batch_size": batch_size, "sequence_length": seq_len, "past_sequence_length": past_seq_len, "total_sequence_length": total_seq_len},
+                // logSeverityLevel: 0,
+            });
+            console.log('...done.');
+
+            // copy to avoid feed input tensor being modified during session.run
+            const feeds_webnn = {...feeds};
+            const results = await session.run(feeds);
+            console.log('cpu ep results: ', results);
+
+            const results_webnn = await session_webnn.run(feeds_webnn);
+            console.log('webnn ep results: ', results_webnn);
+
+            console.log("finished run for", model_path);
+            outputs.forEach(output => {
+                result1 = results[output].data;
+                result2 = results_webnn[output].data;
+                let epsilon = 2e-5;
+                difference = result1.map((x, i) => Math.abs(x - result2[i]));
+                testResult = difference.every((x) => x < epsilon);
+                max_diff = difference.sort().reverse()[0];
+                console.log(difference.sort().reverse());
+                log.innerHTML += output + " max difference: " + max_diff + "<br>";
+            });
+
+            log.innerHTML += "Run done.";
+        };
+
+        async function main() {
+            let model_path = "./models/qwen-layer.onnx";
+            const inputs = ['input_ids', 'attention_mask', 'position_ids', 'past_key_values.0.key', 'past_key_values.0.value'];
+            const outputs = ['/model/layers.0/post_attention_layernorm/output_0', '/model/layers.0/post_attention_layernorm/output_3', 'present.0.key', 'present.0.value'];
+
+            // let model_path = "./models/qwen-layer2.onnx";
+            // const inputs = ['input_ids', 'attention_mask', 'position_ids', 'past_key_values.0.key', 'past_key_values.0.value', 'past_key_values.1.key', 'past_key_values.1.value'];
+            // const outputs = ["/model/layers.1/input_layernorm/output_3", "/model/layers.1/attn/o_proj/MatMul/output_0", "present.0.key", "present.0.value", "present.1.key", "present.1.value"];
+
+            await run(model_path, inputs, outputs);
+        }
+
+        const start = document.getElementById('start');
+        start.onclick = async () => {
+            const dataType = document.getElementById('dataType').value;
+            const queryType = document.getElementById('queryType').value;
+            const stage = document.getElementById('stage').value;
+            await main();
+        };
+
+        function sizeOfShape(shape) {
+            return shape.reduce((a, b) => {
+                return a * b;
+            });
+        }
+        function generateBuffer(dataType, shape, value) {
+            let buffer;
+            const size = sizeOfShape(shape);
+            switch (dataType) {
+                case 'float32':
+                    buffer = new Float32Array(size).fill(value);
+                    break;
+                case 'float16':
+                    buffer = new Float16Array(size).fill(toFloat16(value));
+                    break;
+                case 'int32':
+                    buffer = new Int32Array(size).fill(value);
+                    break;
+                case 'int64':
+                    buffer = new BigInt64Array(size).fill(BigInt(value));
+                    break;
+                default:
+                    throw new Error('Unsupported data type');
+            }
+            return buffer;
+        }
+        function randomBuffer(dataType, shape) {
+            let buffer;
+            const size = sizeOfShape(shape);
+            switch (dataType) {
+                case 'float32':
+                    buffer = new Float32Array(size);
+                    for (let i = 0; i < size; i++) {
+                        buffer[i] = Math.random();
+                    }
+                    break;
+                case 'float16':
+                    buffer = new Float16Array(size);
+                    for (let i = 0; i < size; i++) {
+                        buffer[i] = toFloat16(Math.random());
+                    }
+                    break;
+                default:
+                    throw new Error('Unsupported data type');
+            }
+
+            return buffer;
+        }
+        function pastBuffer(dataType, shape, k) {
+            let buffer;
+            const size = sizeOfShape(shape);
+            switch (dataType) {
+                case 'float32':
+                    buffer = new Float32Array(size);
+                    for (let i = 0; i < size; i++) {
+                        buffer[i] = 0;
+                    }
+                    for (let i = 0; i < shape[0]; i++) {
+                        for (let j = 0; j < shape[1]; j++) {
+                            for (let l = 0; l < k; l++) {
+                                for (let m = 0; m < shape[3]; m++) {
+                                    buffer[i * shape[1] * shape[2] * shape[3] + j * shape[2] * shape[3] + l * shape[3] + m] = Math.random();
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case 'float16':
+                    buffer = new Float16Array(size);
+                    for (let i = 0; i < size; i++) {
+                        buffer[i] = 0;
+                    }
+                    for (let i = 0; i < shape[0]; i++) {
+                        for (let j = 0; j < shape[1]; j++) {
+                            for (let l = 0; l < k; l++) {
+                                for (let m = 0; m < shape[3]; m++) {
+                                    buffer[i * shape[1] * shape[2] * shape[3] + j * shape[2] * shape[3] + l * shape[3] + m] = toFloat16(Math.random());
+                                }
+                            }
+                        }
+                    }
+                    break;
+                default:
+                    throw new Error('Unsupported data type');
+            }
+
+            return buffer;
+        }
+        function toFloat16(value) {
+            // 将 double 转换为 float16 的近似值
+            const buffer = new ArrayBuffer(4);
+            const view = new DataView(buffer);
+            view.setFloat32(0, value, true); // 将 double 转换为 float32
+            const float32Bits = view.getUint32(0, true); // 获取 float32 的位表示
+            const sign = float32Bits & 0x80000000; // 符号位
+            const mantissa = float32Bits & 0x007FFFFF; // 尾数部分
+            let exponent = (float32Bits & 0x7F800000) >> 23; // 指数部分
+
+            if (exponent === 0) {
+                // 非规格化数
+                if (mantissa === 0) {
+                    return 0.0; // 零
+                } else {
+                    // 转换为规格化数
+                    exponent = 127; // 最小的规格化指数
+                    while ((mantissa & 0x800000) === 0) {
+                        mantissa <<= 1;
+                        exponent--;
+                    }
+                    mantissa &= 0x7FFFFF;
+                }
+            } else if (exponent !== 255) {
+                // 规格化数
+                exponent -= 127; // 调整指数偏移
+            } else {
+                // NaN 或无穷大
+                return value; // 直接返回原始值
+            }
+
+            // 转换为 float16
+            exponent = Math.max(-14, Math.min(15, exponent)); // 限制在 float16 的范围内
+            const float16Bits = (sign >> 16) | ((exponent + 15) << 10) | (mantissa >> 13); // 组合 float16 的位表示
+            view.setUint16(0, float16Bits, true); // 设置 float16 的位表示
+            return view.getFloat32(0, true); // 返回 float16 的近似值
+        }
+    </script>
+
+</body>
+
+</html>
